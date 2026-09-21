@@ -1,0 +1,172 @@
+# Облачная сборка и проверка приложения на настоящем Mac с Xcode (GitHub Actions).
+# Запускается сама при каждой загрузке файлов в репозиторий,
+# либо вручную: вкладка Actions → "Сборка и тесты" → Run workflow.
+name: Сборка и тесты
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Получить код
+        uses: actions/checkout@v4
+
+      - name: Выбрать самый новый Xcode
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_*.app | grep -viE 'beta|release_candidate|rc' | sort -V | tail -1)
+          echo "Выбран: $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - name: Сгенерировать проект Xcode (XcodeGen)
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          ls -la
+
+      - name: 1) Компиляция приложения для iPhone (Release, без подписи)
+        run: |
+          set -o pipefail
+          FMT=cat; command -v xcbeautify >/dev/null && FMT=xcbeautify
+          xcodebuild build \
+            -project FinanceApp.xcodeproj -scheme FinanceApp \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            2>&1 | tee build-release.log | $FMT
+
+      - name: Упаковать .ipa (без подписи — подпишет SideStore)
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/FinanceApp.app Payload/
+          zip -qry FinanceApp-unsigned.ipa Payload
+          ls -la FinanceApp-unsigned.ipa
+
+      - name: Найти симулятор iPhone
+        id: sim
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys, re
+          devs = json.load(sys.stdin)["devices"]
+          best = None
+          for runtime, items in devs.items():
+              m = re.search(r"iOS-(\d+)-(\d+)", runtime)
+              if not m: continue
+              ver = (int(m.group(1)), int(m.group(2)))
+              for d in items:
+                  if d["name"].startswith("iPhone") and d.get("isAvailable", True):
+                      if best is None or ver > best[0]:
+                          best = (ver, d["udid"], d["name"])
+          if best:
+              print(best[1])
+              print("Симулятор:", best[2], "iOS %d.%d" % best[0], file=sys.stderr)
+          ')
+          if [ -z "$UDID" ]; then
+            echo "Симулятор не найден — скачиваю платформу iOS"
+            xcodebuild -downloadPlatform iOS
+            UDID=$(xcrun simctl create "iPhone-CI" "iPhone 16" | tail -1)
+          fi
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$UDID" || true
+
+      - name: 2) Юнит-тесты (шифрование, пароль, Excel, форматы)
+        run: |
+          set -o pipefail
+          FMT=cat; command -v xcbeautify >/dev/null && FMT=xcbeautify
+          xcodebuild test \
+            -project FinanceApp.xcodeproj -scheme FinanceApp \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:FinanceAppTests \
+            -resultBundlePath results/unit.xcresult \
+            2>&1 | tee unit-tests.log | $FMT
+
+      - name: 3) UI-тесты со скриншотами
+        id: ui
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          FMT=cat; command -v xcbeautify >/dev/null && FMT=xcbeautify
+          xcodebuild test \
+            -project FinanceApp.xcodeproj -scheme FinanceApp \
+            -destination "id=${{ steps.sim.outputs.udid }}" \
+            -only-testing:FinanceAppUITests \
+            -resultBundlePath results/ui.xcresult \
+            2>&1 | tee ui-tests.log | $FMT
+
+      - name: Извлечь скриншоты
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p screenshots
+          if [ -d results/ui.xcresult ]; then
+            xcrun xcresulttool export attachments --path results/ui.xcresult --output-path screenshots || true
+            # Переименовать файлы по понятным именам из manifest.json
+            if [ -f screenshots/manifest.json ]; then
+              python3 - <<'EOF'
+          import json, os
+          m = json.load(open("screenshots/manifest.json"))
+          for test in m:
+              for a in test.get("attachments", []):
+                  src = os.path.join("screenshots", a["exportedFileName"])
+                  name = a.get("suggestedHumanReadableName") or a["exportedFileName"]
+                  name = name.split("_0_")[0] if "_0_" in name else name
+                  dst = os.path.join("screenshots", name if name.endswith(".png") else name + ".png")
+                  if os.path.exists(src) and not os.path.exists(dst):
+                      os.rename(src, dst)
+          EOF
+            fi
+          fi
+          ls -la screenshots
+
+      - name: Упаковать проект Xcode для сборки на Mac
+        if: always()
+        run: |
+          zip -qry FinanceApp-Xcode-project.zip FinanceApp FinanceApp.xcodeproj FinanceAppTests FinanceAppUITests project.yml README.md || true
+
+      - name: Итог
+        if: always()
+        run: |
+          {
+            echo "## Результат"
+            echo "- Компиляция для iPhone: ${{ job.status == 'success' && '✅' || 'см. журнал' }}"
+            echo "- UI-тесты: ${{ steps.ui.outcome == 'success' && '✅ пройдены' || '⚠️ не пройдены (см. ui-tests.log и скриншоты)' }}"
+            echo ""
+            echo "Скачайте файлы внизу страницы, в разделе **Artifacts**."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Выгрузить приложение (.ipa)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinanceApp-ipa
+          path: FinanceApp-unsigned.ipa
+
+      - name: Выгрузить скриншоты
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: screenshots/
+          if-no-files-found: ignore
+
+      - name: Выгрузить проект Xcode
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinanceApp-Xcode-project
+          path: FinanceApp-Xcode-project.zip
+          if-no-files-found: ignore
+
+      - name: Выгрузить журналы (для диагностики)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            *.log
