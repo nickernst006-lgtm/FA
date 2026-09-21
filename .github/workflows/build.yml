@@ -15,7 +15,29 @@ jobs:
       - name: Получить код
         uses: actions/checkout@v4
 
+      # Если папки загружены с телефона не получилось — достаточно загрузить
+      # в репозиторий один файл FinanceApp_v3.1.zip, он распакуется здесь.
+      - name: Подготовить файлы (распаковать архив, если он загружен)
+        id: prep
+        run: |
+          if [ ! -f project.yml ] || [ ! -d FinanceApp ]; then
+            Z=$(ls -t *.zip 2>/dev/null | head -1)
+            if [ -n "$Z" ]; then
+              echo "Распаковываю $Z"
+              rm -rf _unz && unzip -q -o "$Z" -d _unz
+              P=$(find _unz -name project.yml -not -path '*__MACOSX*' | head -1)
+              if [ -n "$P" ]; then cp -R "$(dirname "$P")"/. . ; fi
+            fi
+          fi
+          echo "Файлы в репозитории:"; ls -la
+          if [ ! -d FinanceApp ] || [ ! -f project.yml ]; then
+            echo "::error::Не найдены папка FinanceApp и файл project.yml. Загрузите в репозиторий архив FinanceApp_v3.1.zip (Add file → Upload files)."
+            exit 1
+          fi
+          echo "Исходники приложения:"; ls FinanceApp
+
       - name: Выбрать самый новый Xcode
+        id: xcode
         run: |
           XCODE=$(ls -d /Applications/Xcode_*.app | grep -viE 'beta|release_candidate|rc' | sort -V | tail -1)
           echo "Выбран: $XCODE"
@@ -25,12 +47,14 @@ jobs:
           sw_vers
 
       - name: Сгенерировать проект Xcode (XcodeGen)
+        id: gen
         run: |
           brew install xcodegen
           xcodegen generate
           ls -la
 
       - name: 1) Компиляция приложения для iPhone (Release, без подписи)
+        id: compile
         run: |
           set -o pipefail
           FMT=cat; command -v xcbeautify >/dev/null && FMT=xcbeautify
@@ -76,6 +100,7 @@ jobs:
           xcrun simctl boot "$UDID" || true
 
       - name: 2) Юнит-тесты (шифрование, пароль, Excel, форматы)
+        id: unit
         run: |
           set -o pipefail
           FMT=cat; command -v xcbeautify >/dev/null && FMT=xcbeautify
@@ -132,12 +157,25 @@ jobs:
       - name: Итог
         if: always()
         run: |
+          st() { case "$1" in success) echo "✅";; failure) echo "❌ ОШИБКА";; skipped) echo "— не выполнялось";; *) echo "$1";; esac; }
           {
             echo "## Результат"
-            echo "- Компиляция для iPhone: ${{ job.status == 'success' && '✅' || 'см. журнал' }}"
-            echo "- UI-тесты: ${{ steps.ui.outcome == 'success' && '✅ пройдены' || '⚠️ не пройдены (см. ui-tests.log и скриншоты)' }}"
+            echo "| Шаг | Итог |"
+            echo "|---|---|"
+            echo "| Файлы на месте | $(st '${{ steps.prep.outcome }}') |"
+            echo "| Xcode | $(st '${{ steps.xcode.outcome }}') |"
+            echo "| Проект Xcode | $(st '${{ steps.gen.outcome }}') |"
+            echo "| Компиляция для iPhone | $(st '${{ steps.compile.outcome }}') |"
+            echo "| Юнит-тесты | $(st '${{ steps.unit.outcome }}') |"
+            echo "| UI-тесты и скриншоты | $(st '${{ steps.ui.outcome }}') |"
             echo ""
-            echo "Скачайте файлы внизу страницы, в разделе **Artifacts**."
+            if ls *.log >/dev/null 2>&1; then
+              echo "### Ошибки компилятора и тестов (если есть)"
+              echo '```'
+              grep -hE "error:|failed|FAILED|XCTAssert" *.log | grep -v "^\s*$" | head -40 || true
+              echo '```'
+            fi
+            echo "Файлы — внизу страницы, в разделе **Artifacts**."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Выгрузить приложение (.ipa)
