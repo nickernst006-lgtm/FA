@@ -121,3 +121,4 @@ jobs:
         with:
           name: logs
           path: "*.log"
+          if-no-files-found: ignore
